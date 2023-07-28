@@ -12,11 +12,61 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.util.Base64;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public class CrptApi {
     private static final String LOCATION = "https://ismp.crpt.ru/";
     private static final String CREATE_DOCUMENT_COMMISSIONING_CONTRACT_REQUEST = "api/v3/lk/documents/commissioning/contract/create";
+    private final List<BucketToken> requestBucket = Collections.synchronizedList(new ArrayList<>());
+    private int requestLimit;
+    private TimeUnit timeUnit;
+    private static class BucketToken{
+
+    }
+    public CrptApi(TimeUnit timeUnit, int requestLimit){
+        this.requestLimit = requestLimit;
+        this.timeUnit = timeUnit;
+        new Thread(() -> {
+            synchronized (requestBucket) {
+                while (true) {
+                    requestBucket.clear();
+                    for (int i = 0; i < requestLimit; i++)
+                        requestBucket.add(new BucketToken());
+                    try {
+                        requestBucket.wait(TimeUnit.MINUTES.toMillis(requestLimit));
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        }).start();
+    }
+
+    private synchronized HttpResponse<String> sendRequest(HttpRequest request){
+        HttpClient client = HttpClient.newHttpClient();
+        HttpResponse<String> response;
+        try {
+            if(!requestBucket.isEmpty()) {
+                System.out.println(Thread.currentThread().toString() + " request...");
+                response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            } else {
+                throw new NumberAPIRequestsExceeded("Number of requests to API exceeded! Max: " + this.requestLimit + " per " + this.timeUnit.toString());
+            }
+        } catch (IOException | InterruptedException e) {
+            //log
+            String message = "Error while request to '" + request.uri().toString() +
+                    "'\nMethod: '" + request.method() +
+                    "'\nHeaders: '" + request.headers().toString() +
+                    "'\nBody: '" + (request.bodyPublisher().isPresent() ? request.bodyPublisher().get() : "empty") + "'";
+            System.out.println(message);
+            throw new HTTPRequestException(message, e);
+        }finally {
+            if(!requestBucket.isEmpty())
+                requestBucket.remove(0);
+        }
+        return response;
+    }
     public APIResponse createDocumentCommissioningContract(Document document, String signature) {
         ObjectMapper mapper = new ObjectMapper();
         DocumentCommissioningContractRequestBody requestBody = new DocumentCommissioningContractRequestBody(DocumentFormat.MANUAL, document,
@@ -32,24 +82,11 @@ public class CrptApi {
         }
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(LOCATION + CREATE_DOCUMENT_COMMISSIONING_CONTRACT_REQUEST))
-                .headers("Authorization", "Bearer " + Authorization.getAuthorization().getPrincipal().getToken(),
+                .headers("Authorization", "Bearer " + Authorization.getAuthorization(this).getPrincipal().getToken(this),
                         "Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .build();
-        HttpClient client = HttpClient.newHttpClient();
-        HttpResponse<String> response;
-        try {
-           response = client.send(request, HttpResponse.BodyHandlers.ofString());
-
-        } catch (IOException | InterruptedException e) {
-            //log
-           String message = "Error while request to '" + request.uri().toString() +
-                    "'\nMethod: '" + request.method() +
-                    "'\nHeaders: '" + request.headers().toString() +
-                    "'\nBody: '" + (request.bodyPublisher().isPresent() ? request.bodyPublisher().get() : "empty") + "'";
-            System.err.println(message);
-            throw new HTTPRequestException(message, e);
-        }
+        HttpResponse<String> response = this.sendRequest(request);
         if (response.statusCode() == HttpURLConnection.HTTP_OK) {
             try {
                 return mapper.readValue(response.body(), OKResponse.class);
@@ -89,36 +126,32 @@ public class CrptApi {
         }
     }
 
+    private static class NumberAPIRequestsExceeded extends RuntimeException{
+        public NumberAPIRequestsExceeded(String message){
+            super(message);
+        }
+    }
+
     private static class Authorization{
         private static final String GET_AUTH_SERT_REQUEST = "api/v3/auth/cert/";
         private static final String GET_SERT_KEY_REQUEST = "api/v3/auth/cert/key";
-
         @Getter
         private Principal principal;
         private static Authorization authorization;
         private Authorization() {
-            this.getNewPrincipal();
         }
 
-        private void getNewPrincipal(){
+        private Authorization(CrptApi crptApi) {
+            this.getNewPrincipal(crptApi);
+        }
+
+        private void getNewPrincipal(CrptApi crptApi){
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(LOCATION + GET_SERT_KEY_REQUEST))
                     .header("Content-Type", "application/json")
                     .GET()
                     .build();
-            HttpClient client = HttpClient.newHttpClient();
-            HttpResponse<String> response;
-            try {
-                response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            } catch (IOException | InterruptedException e) {
-                //log
-                String message = "Error while request to '" + request.uri().toString() +
-                        "'\nMethod: '" + request.method() +
-                        "'\nHeaders: '" + request.headers().toString() +
-                        "'\nBody: '" + (request.bodyPublisher().isPresent() ? request.bodyPublisher().get() : "empty") + "'";
-                System.err.println(message);
-                throw new HTTPRequestException(message, e);
-            }
+            HttpResponse<String> response = crptApi.sendRequest(request);
             ObjectMapper mapper = new ObjectMapper();
             try {
                 principal = mapper.readValue(response.body(), Principal.class);
@@ -130,11 +163,11 @@ public class CrptApi {
             }
         }
 
-        public static Authorization getAuthorization() {
+        public static Authorization getAuthorization(CrptApi crptApi) {
             if (authorization == null) {
                 synchronized (Authorization.class) {
                     if(authorization == null) {
-                        authorization = new Authorization();
+                        authorization = new Authorization(crptApi);
                     }
 
                 }
@@ -166,7 +199,7 @@ public class CrptApi {
             }
 
             @JsonIgnore
-            public String getToken() {
+            public String getToken(CrptApi crptApi) {
                 ObjectMapper mapper = new ObjectMapper();
                 String jsonBody;
                 try {
@@ -182,19 +215,7 @@ public class CrptApi {
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                         .build();
-                HttpClient client = HttpClient.newHttpClient();
-                HttpResponse<String> response;
-                try {
-                    response = client.send(request, HttpResponse.BodyHandlers.ofString());
-                } catch (IOException | InterruptedException e) {
-                    //log
-                    String message = "Error while request to '" + request.uri().toString() +
-                            "'\nMethod: '" + request.method() +
-                            "'\nHeaders: '" + request.headers().toString() +
-                            "'\nBody: '" + (request.bodyPublisher().isPresent() ? request.bodyPublisher().get() : "empty") + "'";
-                    System.err.println(message);
-                    throw new HTTPRequestException(message, e);
-                }
+                HttpResponse<String> response = crptApi.sendRequest(request);
                 try {
                     return mapper.readValue(response.body(), Token.class).getToken();
                 } catch (JsonProcessingException e) {
